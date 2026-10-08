@@ -218,7 +218,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: 76)
+        statusItem.isVisible = true
+        statusItem.button?.title = "USB"
+        statusItem.button?.image = NSImage(systemSymbolName: "externaldrive.fill", accessibilityDescription: "USB Drive Monitor")
+        statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self; statusItem.button?.action = #selector(togglePopover)
         popover = NSPopover(); popover.behavior = .transient; popover.contentSize = NSSize(width: 350, height: 430)
         popover.contentViewController = MonitorViewController(model: model, quit: quit)
@@ -236,7 +240,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let health = model.snapshot.health
         let mark: String; let color: NSColor
         switch health { case .normal: mark = "●"; color = .systemGreen; case .warning: mark = "⚠"; color = .systemOrange; case .critical: mark = "✕"; color = .systemRed; case .disconnected: mark = "–"; color = .secondaryLabelColor; case .unknown: mark = "?"; color = .systemPurple }
-        statusItem.button?.attributedTitle = NSAttributedString(string: "USB \(mark)", attributes: [.foregroundColor: color])
+        statusItem.isVisible = true
+        statusItem.button?.attributedTitle = NSAttributedString(string: "USB \(mark)", attributes: [.foregroundColor: color, .font: NSFont.menuBarFont(ofSize: 0)])
     }
 
     private func quit() {
