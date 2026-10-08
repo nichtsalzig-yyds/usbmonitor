@@ -18,6 +18,8 @@ struct DriveSnapshot: Sendable {
     var operations = "—"
     var activity = "—"
     var errors = 0
+    var lastSystemErrorTime = "暂无"
+    var lastSystemErrorReason = "暂无"
     var lastEvent = "暂无事件"
     var sampling = "Eco：10 秒采样"
     var history = [Double]()
@@ -33,8 +35,20 @@ struct IOMetrics: Sendable {
     let operations: Double
 }
 
+struct SystemErrorRecord: Codable, Equatable, Sendable {
+    let timestamp: Date
+    let message: String
+    let critical: Bool
+}
+
 @MainActor
 final class MonitorModel {
+    private static let lastSystemErrorTimeKey = "lastSystemErrorTime"
+    private static let systemErrorRecordsKey = "systemErrorRecords"
+    private static let maxSystemErrorAge: TimeInterval = 24 * 60 * 60
+    private static let maxSystemErrorRecords = 100
+    private static let maxSystemErrorStorageBytes = 64 * 1024
+
     var ecoMode = true { didSet { restartTimer() } }
     private(set) var snapshot = DriveSnapshot()
     private var timer: Timer?
@@ -42,12 +56,27 @@ final class MonitorModel {
     private var logPipe: Pipe?
     private var wasConnected: Bool?
     private var errorCount = 0
+    private var systemErrorRecords = [SystemErrorRecord]()
+    private var lastLogPrune = Date.distantPast
+
+    init() {
+        systemErrorRecords = Self.loadSystemErrorRecords()
+        errorCount = systemErrorRecords.count
+        if let latest = systemErrorRecords.last {
+            snapshot.lastSystemErrorTime = Self.formatTimestamp(latest.timestamp)
+            snapshot.lastSystemErrorReason = latest.message
+            snapshot.lastEvent = latest.message
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.lastSystemErrorTimeKey)
+        }
+    }
 
     func start() {
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(self, selector: #selector(deviceChanged), name: NSWorkspace.didMountNotification, object: nil)
         center.addObserver(self, selector: #selector(deviceChanged), name: NSWorkspace.didUnmountNotification, object: nil)
         startLogListener()
+        restoreRecentSystemErrors()
         sample()
     }
 
@@ -83,8 +112,11 @@ final class MonitorModel {
     }
 
     private func apply(_ result: DriveSnapshot) {
+        pruneSystemErrorRecordsIfNeeded()
         var next = result
         next.errors = errorCount
+        next.lastSystemErrorTime = snapshot.lastSystemErrorTime
+        next.lastSystemErrorReason = snapshot.lastSystemErrorReason
         if errorCount > 0 && next.health == .normal {
             next.health = errorCount >= 3 ? .critical : .warning
         }
@@ -117,14 +149,14 @@ final class MonitorModel {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/log")
         process.arguments = [
             "stream", "--style", "compact", "--level", "error",
-            "--predicate", "eventMessage CONTAINS[c] 'USB error' OR eventMessage CONTAINS[c] 'USB reset' OR eventMessage CONTAINS[c] 'USB timeout' OR eventMessage CONTAINS[c] 'USB failed' OR eventMessage CONTAINS[c] 'I/O error' OR eventMessage CONTAINS[c] 'disk error' OR eventMessage CONTAINS[c] 'device reset'"
+            "--predicate", "eventMessage CONTAINS[c] 'USB' OR eventMessage CONTAINS[c] 'disk' OR eventMessage CONTAINS[c] 'I/O' OR eventMessage CONTAINS[c] 'media'"
         ]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in self?.recordSystemError(text) }
+            Task { @MainActor in self?.recordSystemErrors(from: text) }
         }
         do {
             try process.run()
@@ -135,26 +167,141 @@ final class MonitorModel {
         }
     }
 
+    private func recordSystemErrors(from text: String) {
+        for line in text.split(separator: "\n").map(String.init) {
+            recordSystemError(line)
+        }
+    }
+
     private func recordSystemError(_ text: String) {
         let targetTokens = [snapshot.device.lowercased(), snapshot.name.lowercased()].filter { $0 != "—" && !$0.isEmpty }
         let line = text.split(separator: "\n").map(String.init).first { candidate in
-            let lower = candidate.lowercased()
-            if lower.contains("filtering the log data using") { return false }
-            let pointsToTarget = lower.range(of: #"\busb\b"#, options: .regularExpression) != nil || targetTokens.contains(where: { lower.contains($0) })
-            let hasError = lower.contains("error") || lower.contains("reset") || lower.contains("timeout") || lower.contains("failed") || lower.contains("i/o")
-            return pointsToTarget && hasError
+            Self.isRelevantStorageError(candidate, targetTokens: targetTokens)
         }
         guard let line else { return }
         let lower = line.lowercased()
-        let hasUSBWord = lower.range(of: #"\busb\b"#, options: .regularExpression) != nil
-        let usbError = hasUSBWord && (lower.contains("error") || lower.contains("reset") || lower.contains("timeout") || lower.contains("failed"))
-        let relevant = usbError || lower.contains("i/o error") || lower.contains("io error") || lower.contains("disk error") || lower.contains("disk failed") || lower.contains("device reset")
-        guard relevant else { return }
-        errorCount += 1
+        let timestamp = Date()
+        let critical = lower.contains("i/o error") || lower.contains("reset") || lower.contains("not responding") || lower.contains("unable") || errorCount + 1 >= 3
+        let message = String(line.trimmingCharacters(in: .whitespacesAndNewlines).prefix(300))
+        let eventTimestamp = Self.timestamp(from: line) ?? timestamp
+        guard !systemErrorRecords.contains(where: { $0.timestamp == eventTimestamp && $0.message == message }) else { return }
+        systemErrorRecords.append(SystemErrorRecord(timestamp: eventTimestamp, message: message, critical: critical))
+        systemErrorRecords = Self.prunedSystemErrorRecords(systemErrorRecords, now: timestamp)
+        errorCount = systemErrorRecords.count
+        persistSystemErrorRecords()
         snapshot.errors = errorCount
-        let critical = lower.contains("i/o error") || lower.contains("reset") || lower.contains("not responding") || lower.contains("unable") || errorCount >= 3
+        snapshot.lastSystemErrorTime = Self.formatTimestamp(eventTimestamp)
+        snapshot.lastSystemErrorReason = message
         snapshot.health = critical ? .critical : .warning
-        snapshot.lastEvent = String(line.trimmingCharacters(in: .whitespacesAndNewlines).prefix(140))
+        snapshot.lastEvent = message
+    }
+
+    private func restoreRecentSystemErrors() {
+        let task = Task.detached(priority: .utility) { Self.readRecentSystemLogText() }
+        Task { @MainActor [weak self] in
+            guard let self, let text = await task.value else { return }
+            self.recordSystemErrors(from: text)
+        }
+    }
+
+    private func pruneSystemErrorRecordsIfNeeded() {
+        let now = Date()
+        guard now.timeIntervalSince(lastLogPrune) >= 60 else { return }
+        lastLogPrune = now
+        let pruned = Self.prunedSystemErrorRecords(systemErrorRecords, now: now)
+        guard pruned != systemErrorRecords else { return }
+        systemErrorRecords = pruned
+        errorCount = pruned.count
+        persistSystemErrorRecords()
+        if let latest = pruned.last {
+            snapshot.lastSystemErrorTime = Self.formatTimestamp(latest.timestamp)
+            snapshot.lastSystemErrorReason = latest.message
+        } else {
+            snapshot.lastSystemErrorTime = "暂无"
+            snapshot.lastSystemErrorReason = "暂无"
+        }
+    }
+
+    private func persistSystemErrorRecords() {
+        guard let data = try? JSONEncoder().encode(systemErrorRecords) else { return }
+        UserDefaults.standard.set(data, forKey: Self.systemErrorRecordsKey)
+        if let latest = systemErrorRecords.last {
+            UserDefaults.standard.set(Self.formatTimestamp(latest.timestamp), forKey: Self.lastSystemErrorTimeKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.lastSystemErrorTimeKey)
+        }
+    }
+
+    private static func loadSystemErrorRecords() -> [SystemErrorRecord] {
+        guard let data = UserDefaults.standard.data(forKey: systemErrorRecordsKey),
+              let records = try? JSONDecoder().decode([SystemErrorRecord].self, from: data) else { return [] }
+        let relevantRecords = records.filter { isRelevantStorageError($0.message, targetTokens: []) }
+        let pruned = prunedSystemErrorRecords(relevantRecords, now: Date())
+        if let prunedData = try? JSONEncoder().encode(pruned) {
+            UserDefaults.standard.set(prunedData, forKey: systemErrorRecordsKey)
+        }
+        return pruned
+    }
+
+    private static func isRelevantStorageError(_ text: String, targetTokens: [String]) -> Bool {
+        let lower = text.lowercased()
+        if lower.contains("filtering the log data using") { return false }
+        let hasError = lower.contains("error") || lower.contains("reset") || lower.contains("timeout") || lower.contains("failed") || lower.contains("not responding") || lower.contains("unavailable")
+        guard hasError else { return false }
+
+        let namesTarget = targetTokens.contains(where: { !$0.isEmpty && lower.contains($0) })
+        let hasUSBStorageMarker = lower.contains("iousb") || lower.contains("usbmsc") || lower.contains("usb mass storage") || lower.contains("usbhost") || lower.range(of: #"\busb\s+(device|error|reset|timeout|failed|storage)\b"#, options: .regularExpression) != nil
+        let hasDiskStorageMarker = lower.range(of: #"(?:/dev/)?disk\d+\b"#, options: .regularExpression) != nil || lower.range(of: #"\bdisk\s+(error|reset|timeout|failed|i/o|not responding)\b"#, options: .regularExpression) != nil
+        let hasStorageIO = lower.contains("i/o error") || lower.contains("io error") || lower.contains("media error") || lower.contains("media not present")
+        return namesTarget || hasUSBStorageMarker || hasDiskStorageMarker || (hasStorageIO && (lower.contains("usb") || lower.contains("disk") || lower.contains("media")))
+    }
+
+    private static func prunedSystemErrorRecords(_ records: [SystemErrorRecord], now: Date) -> [SystemErrorRecord] {
+        var kept = records.filter { now.timeIntervalSince($0.timestamp) <= maxSystemErrorAge }
+        if kept.count > maxSystemErrorRecords {
+            kept.removeFirst(kept.count - maxSystemErrorRecords)
+        }
+        while kept.count > 1,
+              let data = try? JSONEncoder().encode(kept),
+              data.count > maxSystemErrorStorageBytes {
+            kept.removeFirst()
+        }
+        return kept
+    }
+
+    private static func formatTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
+    private static func timestamp(from line: String) -> Date? {
+        let prefix = String(line.prefix(23))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return formatter.date(from: prefix)
+    }
+
+    nonisolated private static func readRecentSystemLogText() -> String? {
+        let maxReadBytes = 64 * 1024
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        process.arguments = [
+            "show", "--last", "24h", "--style", "compact", "--level", "error",
+            "--predicate", "eventMessage CONTAINS[c] 'USB' OR eventMessage CONTAINS[c] 'disk' OR eventMessage CONTAINS[c] 'I/O' OR eventMessage CONTAINS[c] 'media'"
+        ]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+
+        let data = pipe.fileHandleForReading.readData(ofLength: maxReadBytes + 1)
+        if process.isRunning { process.terminate() }
+        process.waitUntilExit()
+        return String(data: data.prefix(maxReadBytes), encoding: .utf8)
     }
 
     nonisolated private static func readSnapshot() -> DriveSnapshot {
@@ -224,7 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "externaldrive.fill", accessibilityDescription: "USB Drive Monitor")
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self; statusItem.button?.action = #selector(togglePopover)
-        popover = NSPopover(); popover.behavior = .transient; popover.contentSize = NSSize(width: 350, height: 430)
+        popover = NSPopover(); popover.behavior = .transient; popover.contentSize = NSSize(width: 350, height: 470)
         popover.contentViewController = MonitorViewController(model: model, quit: quit)
         model.start()
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.updateStatus() } }
@@ -258,7 +405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class MonitorViewController: NSViewController {
     private let model: MonitorModel
     private let quitAction: () -> Void
-    private let fields = (0..<9).map { _ in NSTextField(labelWithString: "") }
+    private let fields = (0..<11).map { _ in NSTextField(labelWithString: "") }
     private let trend = NSTextField(labelWithString: "")
     private let eco = NSSwitch()
     private let ecoState = NSTextField(labelWithString: "")
@@ -267,9 +414,10 @@ final class MonitorViewController: NSViewController {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func loadView() {
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 350, height: 430))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 350, height: 470))
         fields[0].font = .boldSystemFont(ofSize: 17); fields[1].font = .boldSystemFont(ofSize: 14); fields[2].textColor = .secondaryLabelColor; trend.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-        let stack = NSStackView(views: [fields[0], fields[1], fields[2], separator(), fields[3], fields[4], fields[5], fields[6], fields[7], fields[8], separator(), NSTextField(labelWithString: "最近趋势（内存，约 10 分钟）"), trend, ecoRow(), NSTextField(labelWithString: "Eco：10 秒采样；异常：2 秒采样\n增强：5 秒采样；异常：1 秒采样"), button("退出工具", action: #selector(quit))])
+        fields[10].lineBreakMode = .byWordWrapping; fields[10].maximumNumberOfLines = 2; fields[10].preferredMaxLayoutWidth = 314
+        let stack = NSStackView(views: [fields[0], fields[1], fields[2], separator(), fields[3], fields[4], fields[5], fields[6], fields[7], fields[8], fields[9], fields[10], separator(), NSTextField(labelWithString: "最近趋势（内存，约 10 分钟）"), trend, ecoRow(), NSTextField(labelWithString: "Eco：10 秒采样；异常：2 秒采样\n增强：5 秒采样；异常：1 秒采样"), button("退出工具", action: #selector(quit))])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8; stack.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18), stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18), stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16)])
         eco.state = .on; eco.isEnabled = true; eco.target = self; eco.action = #selector(toggleEco); ecoState.font = .systemFont(ofSize: 12, weight: .medium); view = root
@@ -287,7 +435,7 @@ final class MonitorViewController: NSViewController {
         let snap = model.snapshot
         fields[0].stringValue = snap.name; fields[1].stringValue = "状态：\(snap.health.rawValue)"; fields[2].stringValue = snap.lastEvent
         fields[1].textColor = snap.health == .normal ? .systemGreen : (snap.health == .warning ? .systemOrange : .systemRed)
-        fields[3].stringValue = "设备：\(snap.device)"; fields[4].stringValue = "连接：\(snap.connection)"; fields[5].stringValue = "吞吐量：\(snap.throughput)"; fields[6].stringValue = "I/O 次数：\(snap.operations)"; fields[7].stringValue = "活动状态：\(snap.activity)"; fields[8].stringValue = "系统错误：\(snap.errors)（被动日志监听）"
+        fields[3].stringValue = "设备：\(snap.device)"; fields[4].stringValue = "连接：\(snap.connection)"; fields[5].stringValue = "吞吐量：\(snap.throughput)"; fields[6].stringValue = "I/O 次数：\(snap.operations)"; fields[7].stringValue = "活动状态：\(snap.activity)"; fields[8].stringValue = "系统错误：\(snap.errors)（最近 24 小时，最多 100 条）"; fields[9].stringValue = "上一次系统错误时间：\(snap.lastSystemErrorTime)"; fields[10].stringValue = "错误日志：\(snap.lastSystemErrorReason)"
         ecoState.stringValue = model.ecoMode ? "已开启 · 低负荷" : "已关闭 · 增强采样"
         ecoState.textColor = model.ecoMode ? .systemGreen : .systemOrange
         trend.stringValue = snap.history.isEmpty ? "暂无采样" : snap.history.map { String(repeating: "▮", count: max(1, min(10, Int($0 / 10)))) }.joined(separator: " ")
