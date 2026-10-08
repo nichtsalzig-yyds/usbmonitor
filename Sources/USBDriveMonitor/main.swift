@@ -233,7 +233,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
-        if popover.isShown { popover.performClose(nil) } else { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
     }
 
     private func updateStatus() {
@@ -256,7 +261,6 @@ final class MonitorViewController: NSViewController {
     private let fields = (0..<9).map { _ in NSTextField(labelWithString: "") }
     private let trend = NSTextField(labelWithString: "")
     private let eco = NSSwitch()
-    private let ecoIndicator = NSTextField(labelWithString: "●")
     private let ecoState = NSTextField(labelWithString: "")
 
     init(model: MonitorModel, quit: @escaping () -> Void) { self.model = model; self.quitAction = quit; super.init(nibName: nil, bundle: nil) }
@@ -268,13 +272,13 @@ final class MonitorViewController: NSViewController {
         let stack = NSStackView(views: [fields[0], fields[1], fields[2], separator(), fields[3], fields[4], fields[5], fields[6], fields[7], fields[8], separator(), NSTextField(labelWithString: "最近趋势（内存，约 10 分钟）"), trend, ecoRow(), NSTextField(labelWithString: "Eco：10 秒采样；异常：2 秒采样\n增强：5 秒采样；异常：1 秒采样"), button("退出工具", action: #selector(quit))])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8; stack.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18), stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18), stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16)])
-        eco.state = .on; eco.isEnabled = true; eco.target = self; eco.action = #selector(toggleEco); ecoIndicator.font = .systemFont(ofSize: 14, weight: .bold); ecoState.font = .systemFont(ofSize: 12, weight: .medium); view = root
+        eco.state = .on; eco.isEnabled = true; eco.target = self; eco.action = #selector(toggleEco); ecoState.font = .systemFont(ofSize: 12, weight: .medium); view = root
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.refresh() } }; refresh()
     }
 
     private func separator() -> NSBox { let box = NSBox(); box.boxType = .separator; return box }
     private func row(_ text: String, _ control: NSControl) -> NSStackView { NSStackView(views: [NSTextField(labelWithString: text), control]) }
-    private func ecoRow() -> NSStackView { NSStackView(views: [NSTextField(labelWithString: "Eco 模式"), ecoIndicator, eco, ecoState]) }
+    private func ecoRow() -> NSStackView { NSStackView(views: [NSTextField(labelWithString: "Eco 模式"), eco, ecoState]) }
     private func button(_ title: String, action: Selector) -> NSButton { let button = NSButton(title: title, target: self, action: action); button.bezelStyle = .rounded; return button }
     @objc private func toggleEco() { model.ecoMode = eco.state == .on; refresh() }
     @objc private func quit() { quitAction() }
@@ -286,7 +290,6 @@ final class MonitorViewController: NSViewController {
         fields[3].stringValue = "设备：\(snap.device)"; fields[4].stringValue = "连接：\(snap.connection)"; fields[5].stringValue = "吞吐量：\(snap.throughput)"; fields[6].stringValue = "I/O 次数：\(snap.operations)"; fields[7].stringValue = "活动状态：\(snap.activity)"; fields[8].stringValue = "系统错误：\(snap.errors)（被动日志监听）"
         ecoState.stringValue = model.ecoMode ? "已开启 · 低负荷" : "已关闭 · 增强采样"
         ecoState.textColor = model.ecoMode ? .systemGreen : .systemOrange
-        ecoIndicator.textColor = model.ecoMode ? .systemBlue : .secondaryLabelColor
         trend.stringValue = snap.history.isEmpty ? "暂无采样" : snap.history.map { String(repeating: "▮", count: max(1, min(10, Int($0 / 10)))) }.joined(separator: " ")
     }
 }
