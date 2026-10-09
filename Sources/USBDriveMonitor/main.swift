@@ -416,6 +416,9 @@ final class MonitorViewController: NSViewController {
     override func loadView() {
         let root = NSView(frame: NSRect(x: 0, y: 0, width: 350, height: 470))
         fields[0].font = .boldSystemFont(ofSize: 17); fields[1].font = .boldSystemFont(ofSize: 14); fields[2].textColor = .secondaryLabelColor; trend.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        trend.translatesAutoresizingMaskIntoConstraints = false
+        trend.widthAnchor.constraint(equalToConstant: 314).isActive = true
+        trend.maximumNumberOfLines = 1; trend.lineBreakMode = .byTruncatingTail
         fields[10].lineBreakMode = .byWordWrapping; fields[10].maximumNumberOfLines = 2; fields[10].preferredMaxLayoutWidth = 314
         let stack = NSStackView(views: [fields[0], fields[1], fields[2], separator(), fields[3], fields[4], fields[5], fields[6], fields[7], fields[8], fields[9], fields[10], separator(), NSTextField(labelWithString: "最近趋势（内存，约 10 分钟）"), trend, ecoRow(), NSTextField(labelWithString: "Eco：10 秒采样；异常：2 秒采样\n增强：5 秒采样；异常：1 秒采样"), button("退出工具", action: #selector(quit))])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8; stack.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(stack)
@@ -438,7 +441,8 @@ final class MonitorViewController: NSViewController {
         fields[3].stringValue = "设备：\(snap.device)"; fields[4].stringValue = "连接：\(snap.connection)"; fields[5].stringValue = "吞吐量：\(snap.throughput)"; fields[6].stringValue = "I/O 次数：\(snap.operations)"; fields[7].stringValue = "活动状态：\(snap.activity)"; fields[8].stringValue = "系统错误：\(snap.errors)（最近 24 小时，最多 100 条）"; fields[9].stringValue = "上一次系统错误时间：\(snap.lastSystemErrorTime)"; fields[10].stringValue = "错误日志：\(snap.lastSystemErrorReason)"
         ecoState.stringValue = model.ecoMode ? "已开启 · 低负荷" : "已关闭 · 增强采样"
         ecoState.textColor = model.ecoMode ? .systemGreen : .systemOrange
-        trend.stringValue = snap.history.isEmpty ? "暂无采样" : snap.history.map { String(repeating: "▮", count: max(1, min(10, Int($0 / 10)))) }.joined(separator: " ")
+        let levels = Array("▁▂▃▄▅▆▇█")
+        trend.stringValue = snap.history.isEmpty ? "暂无采样" : snap.history.suffix(24).map { value in String(levels[max(0, min(levels.count - 1, Int(value / 12.5)))]) }.joined()
     }
 }
 
