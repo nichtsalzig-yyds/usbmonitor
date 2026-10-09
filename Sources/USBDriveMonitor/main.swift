@@ -409,12 +409,13 @@ final class TwoLineStatusBarView: NSView {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let model = MonitorModel()
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var twoLineStatusBarView: TwoLineStatusBarView?
     private var statusBarPresentation: Bool?
+    private var pendingStatusBarPresentation = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -424,9 +425,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "externaldrive.fill", accessibilityDescription: "USB Drive Monitor")
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self; statusItem.button?.action = #selector(togglePopover)
-        popover = NSPopover(); popover.behavior = .transient; popover.contentSize = NSSize(width: 350, height: 470)
+        popover = NSPopover(); popover.behavior = .transient; popover.delegate = self; popover.contentSize = NSSize(width: 350, height: 470)
         popover.contentViewController = MonitorViewController(model: model, quit: quit)
-        model.onStatusBarPresentationChange = { [weak self] in self?.updateStatus() }
+        model.onStatusBarPresentationChange = { [weak self] in self?.statusBarPresentationDidChange() }
         model.start()
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.updateStatus() } }
         updateStatus()
@@ -448,12 +449,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func statusBarPresentationDidChange() {
+        updateStatus()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        guard pendingStatusBarPresentation else { return }
+        pendingStatusBarPresentation = false
+        updateStatus()
+    }
+
     private func updateStatus() {
         let health = model.snapshot.health
         let mark: String; let color: NSColor
         switch health { case .normal: mark = "●"; color = .systemGreen; case .warning: mark = "⚠"; color = .systemOrange; case .critical: mark = "✕"; color = .systemRed; case .disconnected: mark = "–"; color = .secondaryLabelColor; case .unknown: mark = "?"; color = .systemPurple }
         statusItem.isVisible = true
-        if statusBarPresentation != model.showsThroughputInStatusBar {
+        if statusBarPresentation != model.showsThroughputInStatusBar && popover.isShown {
+            pendingStatusBarPresentation = true
+        } else if statusBarPresentation != model.showsThroughputInStatusBar {
             statusBarPresentation = model.showsThroughputInStatusBar
             if model.showsThroughputInStatusBar {
                 let view = twoLineStatusBarView ?? TwoLineStatusBarView(frame: NSRect(x: 0, y: 0, width: 66, height: 26))
