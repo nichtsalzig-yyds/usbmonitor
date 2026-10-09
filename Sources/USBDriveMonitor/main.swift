@@ -45,11 +45,14 @@ struct SystemErrorRecord: Codable, Equatable, Sendable {
 final class MonitorModel {
     private static let lastSystemErrorTimeKey = "lastSystemErrorTime"
     private static let systemErrorRecordsKey = "systemErrorRecords"
+    private static let showThroughputInStatusBarKey = "showThroughputInStatusBar"
     private static let maxSystemErrorAge: TimeInterval = 24 * 60 * 60
     private static let maxSystemErrorRecords = 100
     private static let maxSystemErrorStorageBytes = 64 * 1024
 
     var ecoMode = true { didSet { restartTimer() } }
+    private(set) var showsThroughputInStatusBar = false
+    var onStatusBarPresentationChange: (() -> Void)?
     private(set) var snapshot = DriveSnapshot()
     private var timer: Timer?
     private var logProcess: Process?
@@ -60,6 +63,7 @@ final class MonitorModel {
     private var lastLogPrune = Date.distantPast
 
     init() {
+        showsThroughputInStatusBar = UserDefaults.standard.bool(forKey: Self.showThroughputInStatusBarKey)
         systemErrorRecords = Self.loadSystemErrorRecords()
         errorCount = systemErrorRecords.count
         if let latest = systemErrorRecords.last {
@@ -69,6 +73,13 @@ final class MonitorModel {
         } else {
             UserDefaults.standard.removeObject(forKey: Self.lastSystemErrorTimeKey)
         }
+    }
+
+    func setShowsThroughputInStatusBar(_ enabled: Bool) {
+        guard showsThroughputInStatusBar != enabled else { return }
+        showsThroughputInStatusBar = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.showThroughputInStatusBarKey)
+        onStatusBarPresentationChange?()
     }
 
     func start() {
@@ -358,10 +369,52 @@ final class MonitorModel {
 }
 
 @MainActor
+final class TwoLineStatusBarView: NSView {
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let throughputLabel = NSTextField(labelWithString: "")
+    var onClick: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let stack = NSStackView(views: [statusLabel, throughputLabel])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 66),
+            heightAnchor.constraint(equalToConstant: 26),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        statusLabel.font = .menuBarFont(ofSize: 0)
+        throughputLabel.font = .systemFont(ofSize: 9)
+        throughputLabel.textColor = .secondaryLabelColor
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(mark: String, color: NSColor, throughput: String) {
+        statusLabel.stringValue = "USB \(mark)"
+        statusLabel.textColor = color
+        throughputLabel.stringValue = throughput
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = MonitorModel()
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
+    private var twoLineStatusBarView: TwoLineStatusBarView?
+    private var statusBarPresentation: Bool?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -373,18 +426,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self; statusItem.button?.action = #selector(togglePopover)
         popover = NSPopover(); popover.behavior = .transient; popover.contentSize = NSSize(width: 350, height: 470)
         popover.contentViewController = MonitorViewController(model: model, quit: quit)
+        model.onStatusBarPresentationChange = { [weak self] in self?.updateStatus() }
         model.start()
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.updateStatus() } }
         updateStatus()
     }
 
     @objc private func togglePopover() {
-        guard let button = statusItem.button else { return }
+        let anchor: NSView?
+        if model.showsThroughputInStatusBar {
+            anchor = twoLineStatusBarView
+        } else {
+            anchor = statusItem.button
+        }
+        guard let anchor else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
             NSApp.activate(ignoringOtherApps: true)
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
         }
     }
 
@@ -393,7 +453,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mark: String; let color: NSColor
         switch health { case .normal: mark = "●"; color = .systemGreen; case .warning: mark = "⚠"; color = .systemOrange; case .critical: mark = "✕"; color = .systemRed; case .disconnected: mark = "–"; color = .secondaryLabelColor; case .unknown: mark = "?"; color = .systemPurple }
         statusItem.isVisible = true
-        statusItem.button?.attributedTitle = NSAttributedString(string: "USB \(mark)", attributes: [.foregroundColor: color, .font: NSFont.menuBarFont(ofSize: 0)])
+        if statusBarPresentation != model.showsThroughputInStatusBar {
+            statusBarPresentation = model.showsThroughputInStatusBar
+            if model.showsThroughputInStatusBar {
+                let view = twoLineStatusBarView ?? TwoLineStatusBarView(frame: NSRect(x: 0, y: 0, width: 66, height: 26))
+                view.onClick = { [weak self] in self?.togglePopover() }
+                twoLineStatusBarView = view
+                statusItem.view = view
+                statusItem.length = 66
+            } else {
+                statusItem.view = nil
+                statusItem.length = NSStatusItem.variableLength
+                statusItem.button?.image = NSImage(systemSymbolName: "externaldrive.fill", accessibilityDescription: "USB Drive Monitor")
+                statusItem.button?.imagePosition = .imageLeading
+                statusItem.button?.target = self
+                statusItem.button?.action = #selector(togglePopover)
+            }
+        }
+        if model.showsThroughputInStatusBar {
+            twoLineStatusBarView?.update(mark: mark, color: color, throughput: model.snapshot.throughput)
+        } else {
+            statusItem.button?.attributedTitle = NSAttributedString(string: "USB \(mark)", attributes: [.foregroundColor: color, .font: NSFont.menuBarFont(ofSize: 0)])
+        }
     }
 
     private func quit() {
@@ -409,6 +490,8 @@ final class MonitorViewController: NSViewController {
     private let trend = NSTextField(labelWithString: "")
     private let eco = NSSwitch()
     private let ecoState = NSTextField(labelWithString: "")
+    private let statusBarThroughput = NSSwitch()
+    private let statusBarThroughputState = NSTextField(labelWithString: "")
 
     init(model: MonitorModel, quit: @escaping () -> Void) { self.model = model; self.quitAction = quit; super.init(nibName: nil, bundle: nil) }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -420,18 +503,21 @@ final class MonitorViewController: NSViewController {
         trend.widthAnchor.constraint(equalToConstant: 314).isActive = true
         trend.maximumNumberOfLines = 1; trend.lineBreakMode = .byTruncatingTail
         fields[10].lineBreakMode = .byWordWrapping; fields[10].maximumNumberOfLines = 2; fields[10].preferredMaxLayoutWidth = 314
-        let stack = NSStackView(views: [fields[0], fields[1], fields[2], separator(), fields[3], fields[4], fields[5], fields[6], fields[7], fields[8], fields[9], fields[10], separator(), NSTextField(labelWithString: "最近趋势（内存，约 10 分钟）"), trend, ecoRow(), NSTextField(labelWithString: "Eco：10 秒采样；异常：2 秒采样\n增强：5 秒采样；异常：1 秒采样"), button("退出工具", action: #selector(quit))])
+        let stack = NSStackView(views: [fields[0], fields[1], fields[2], separator(), fields[3], fields[4], fields[5], statusBarThroughputRow(), fields[6], fields[7], fields[8], fields[9], fields[10], separator(), NSTextField(labelWithString: "最近趋势（内存，约 10 分钟）"), trend, ecoRow(), NSTextField(labelWithString: "Eco：10 秒采样；异常：2 秒采样\n增强：5 秒采样；异常：1 秒采样"), button("退出工具", action: #selector(quit))])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8; stack.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18), stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18), stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16)])
         eco.state = .on; eco.isEnabled = true; eco.target = self; eco.action = #selector(toggleEco); ecoState.font = .systemFont(ofSize: 12, weight: .medium); view = root
+        statusBarThroughput.target = self; statusBarThroughput.action = #selector(toggleStatusBarThroughput); statusBarThroughputState.font = .systemFont(ofSize: 12, weight: .medium)
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.refresh() } }; refresh()
     }
 
     private func separator() -> NSBox { let box = NSBox(); box.boxType = .separator; return box }
     private func row(_ text: String, _ control: NSControl) -> NSStackView { NSStackView(views: [NSTextField(labelWithString: text), control]) }
+    private func statusBarThroughputRow() -> NSStackView { NSStackView(views: [NSTextField(labelWithString: "状态栏显示吞吐量"), statusBarThroughput, statusBarThroughputState]) }
     private func ecoRow() -> NSStackView { NSStackView(views: [NSTextField(labelWithString: "Eco 模式"), eco, ecoState]) }
     private func button(_ title: String, action: Selector) -> NSButton { let button = NSButton(title: title, target: self, action: action); button.bezelStyle = .rounded; return button }
     @objc private func toggleEco() { model.ecoMode = eco.state == .on; refresh() }
+    @objc private func toggleStatusBarThroughput() { model.setShowsThroughputInStatusBar(statusBarThroughput.state == .on); refresh() }
     @objc private func quit() { quitAction() }
 
     private func refresh() {
@@ -439,6 +525,9 @@ final class MonitorViewController: NSViewController {
         fields[0].stringValue = snap.name; fields[1].stringValue = "状态：\(snap.health.rawValue)"; fields[2].stringValue = snap.lastEvent
         fields[1].textColor = snap.health == .normal ? .systemGreen : (snap.health == .warning ? .systemOrange : .systemRed)
         fields[3].stringValue = "设备：\(snap.device)"; fields[4].stringValue = "连接：\(snap.connection)"; fields[5].stringValue = "吞吐量：\(snap.throughput)"; fields[6].stringValue = "I/O 次数：\(snap.operations)"; fields[7].stringValue = "活动状态：\(snap.activity)"; fields[8].stringValue = "系统错误：\(snap.errors)（最近 24 小时，最多 100 条）"; fields[9].stringValue = "上一次系统错误时间：\(snap.lastSystemErrorTime)"; fields[10].stringValue = "错误日志：\(snap.lastSystemErrorReason)"
+        statusBarThroughput.state = model.showsThroughputInStatusBar ? .on : .off
+        statusBarThroughputState.stringValue = model.showsThroughputInStatusBar ? "已开启 · 两行显示" : "已关闭 · 保持当前状态栏"
+        statusBarThroughputState.textColor = model.showsThroughputInStatusBar ? .systemGreen : .secondaryLabelColor
         ecoState.stringValue = model.ecoMode ? "已开启 · 低负荷" : "已关闭 · 增强采样"
         ecoState.textColor = model.ecoMode ? .systemGreen : .systemOrange
         let levels = Array("▁▂▃▄▅▆▇█")
