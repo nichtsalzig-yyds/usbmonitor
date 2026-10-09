@@ -503,7 +503,7 @@ final class MonitorViewController: NSViewController {
         trend.widthAnchor.constraint(equalToConstant: 314).isActive = true
         trend.maximumNumberOfLines = 1; trend.lineBreakMode = .byTruncatingTail
         fields[10].lineBreakMode = .byWordWrapping; fields[10].maximumNumberOfLines = 2; fields[10].preferredMaxLayoutWidth = 314
-        let stack = NSStackView(views: [fields[0], fields[1], fields[2], separator(), fields[3], fields[4], fields[5], statusBarThroughputRow(), fields[6], fields[7], fields[8], fields[9], fields[10], separator(), NSTextField(labelWithString: "最近趋势（内存，约 10 分钟）"), trend, ecoRow(), NSTextField(labelWithString: "Eco：10 秒采样；异常：2 秒采样\n增强：5 秒采样；异常：1 秒采样"), button("退出工具", action: #selector(quit))])
+        let stack = NSStackView(views: [fields[0], fields[1], fields[2], separator(), fields[3], fields[4], throughputRow(), fields[6], fields[7], fields[8], fields[9], fields[10], separator(), NSTextField(labelWithString: "最近趋势（内存，约 10 分钟）"), trend, ecoRow(), NSTextField(labelWithString: "Eco：10 秒采样；异常：2 秒采样\n增强：5 秒采样；异常：1 秒采样"), button("退出工具", action: #selector(quit))])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8; stack.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18), stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18), stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16)])
         eco.state = .on; eco.isEnabled = true; eco.target = self; eco.action = #selector(toggleEco); ecoState.font = .systemFont(ofSize: 12, weight: .medium); view = root
@@ -513,7 +513,11 @@ final class MonitorViewController: NSViewController {
 
     private func separator() -> NSBox { let box = NSBox(); box.boxType = .separator; return box }
     private func row(_ text: String, _ control: NSControl) -> NSStackView { NSStackView(views: [NSTextField(labelWithString: text), control]) }
-    private func statusBarThroughputRow() -> NSStackView { NSStackView(views: [NSTextField(labelWithString: "状态栏显示吞吐量"), statusBarThroughput, statusBarThroughputState]) }
+    private func throughputRow() -> NSStackView {
+        let row = NSStackView(views: [fields[5], statusBarThroughput, statusBarThroughputState])
+        row.alignment = .centerY; row.spacing = 6
+        return row
+    }
     private func ecoRow() -> NSStackView { NSStackView(views: [NSTextField(labelWithString: "Eco 模式"), eco, ecoState]) }
     private func button(_ title: String, action: Selector) -> NSButton { let button = NSButton(title: title, target: self, action: action); button.bezelStyle = .rounded; return button }
     @objc private func toggleEco() { model.ecoMode = eco.state == .on; refresh() }
@@ -526,7 +530,7 @@ final class MonitorViewController: NSViewController {
         fields[1].textColor = snap.health == .normal ? .systemGreen : (snap.health == .warning ? .systemOrange : .systemRed)
         fields[3].stringValue = "设备：\(snap.device)"; fields[4].stringValue = "连接：\(snap.connection)"; fields[5].stringValue = "吞吐量：\(snap.throughput)"; fields[6].stringValue = "I/O 次数：\(snap.operations)"; fields[7].stringValue = "活动状态：\(snap.activity)"; fields[8].stringValue = "系统错误：\(snap.errors)（最近 24 小时，最多 100 条）"; fields[9].stringValue = "上一次系统错误时间：\(snap.lastSystemErrorTime)"; fields[10].stringValue = "错误日志：\(snap.lastSystemErrorReason)"
         statusBarThroughput.state = model.showsThroughputInStatusBar ? .on : .off
-        statusBarThroughputState.stringValue = model.showsThroughputInStatusBar ? "已开启 · 两行显示" : "已关闭 · 保持当前状态栏"
+        statusBarThroughputState.stringValue = model.showsThroughputInStatusBar ? "实时显示" : "不显示"
         statusBarThroughputState.textColor = model.showsThroughputInStatusBar ? .systemGreen : .secondaryLabelColor
         ecoState.stringValue = model.ecoMode ? "已开启 · 低负荷" : "已关闭 · 增强采样"
         ecoState.textColor = model.ecoMode ? .systemGreen : .systemOrange
