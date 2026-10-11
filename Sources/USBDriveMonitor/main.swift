@@ -13,6 +13,7 @@ struct DriveSnapshot: Sendable {
     var health: Health = .unknown
     var device = "—"
     var name = "USB Drive"
+    var deviceTreePath = ""
     var connection = "检测中"
     var throughput = "—"
     var operations = "—"
@@ -28,6 +29,7 @@ struct DriveSnapshot: Sendable {
 struct USBDevice: Sendable {
     let node: String
     let name: String
+    let deviceTreePath: String
 }
 
 struct IOMetrics: Sendable {
@@ -46,6 +48,9 @@ final class MonitorModel {
     private static let lastSystemErrorTimeKey = "lastSystemErrorTime"
     private static let systemErrorRecordsKey = "systemErrorRecords"
     private static let showThroughputInStatusBarKey = "showThroughputInStatusBar"
+    private static let targetDeviceTreePathKey = "targetDeviceTreePath"
+    private static let targetDeviceNameKey = "targetDeviceName"
+    private static let defaultTargetDeviceName = "PSSD T9"
     private static let maxSystemErrorAge: TimeInterval = 24 * 60 * 60
     private static let maxSystemErrorRecords = 100
     private static let maxSystemErrorStorageBytes = 64 * 1024
@@ -61,10 +66,14 @@ final class MonitorModel {
     private var errorCount = 0
     private var systemErrorRecords = [SystemErrorRecord]()
     private var lastLogPrune = Date.distantPast
+    private var targetDeviceTreePath: String?
+    private var targetDeviceName: String
 
     init() {
         showsThroughputInStatusBar = UserDefaults.standard.bool(forKey: Self.showThroughputInStatusBarKey)
-        systemErrorRecords = Self.loadSystemErrorRecords()
+        targetDeviceTreePath = UserDefaults.standard.string(forKey: Self.targetDeviceTreePathKey)
+        targetDeviceName = UserDefaults.standard.string(forKey: Self.targetDeviceNameKey) ?? Self.defaultTargetDeviceName
+        systemErrorRecords = Self.loadSystemErrorRecords(targetTokens: [targetDeviceName.lowercased()])
         errorCount = systemErrorRecords.count
         if let latest = systemErrorRecords.last {
             snapshot.lastSystemErrorTime = Self.formatTimestamp(latest.timestamp)
@@ -115,7 +124,11 @@ final class MonitorModel {
     }
 
     private func sample() {
-        let task = Task.detached(priority: .utility) { Self.readSnapshot() }
+        let targetPath = targetDeviceTreePath
+        let targetName = targetDeviceName
+        let task = Task.detached(priority: .utility) {
+            Self.readSnapshot(targetDeviceTreePath: targetPath, targetDeviceName: targetName)
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.apply(await task.value)
@@ -124,6 +137,12 @@ final class MonitorModel {
 
     private func apply(_ result: DriveSnapshot) {
         pruneSystemErrorRecordsIfNeeded()
+        if targetDeviceTreePath == nil, !result.deviceTreePath.isEmpty {
+            targetDeviceTreePath = result.deviceTreePath
+            targetDeviceName = result.name
+            UserDefaults.standard.set(result.deviceTreePath, forKey: Self.targetDeviceTreePathKey)
+            UserDefaults.standard.set(result.name, forKey: Self.targetDeviceNameKey)
+        }
         var next = result
         next.errors = errorCount
         next.lastSystemErrorTime = snapshot.lastSystemErrorTime
@@ -185,7 +204,7 @@ final class MonitorModel {
     }
 
     private func recordSystemError(_ text: String) {
-        let targetTokens = [snapshot.device.lowercased(), snapshot.name.lowercased()].filter { $0 != "—" && !$0.isEmpty }
+        let targetTokens = targetLogTokens
         let line = text.split(separator: "\n").map(String.init).first { candidate in
             Self.isRelevantStorageError(candidate, targetTokens: targetTokens)
         }
@@ -213,6 +232,12 @@ final class MonitorModel {
             guard let self, let text = await task.value else { return }
             self.recordSystemErrors(from: text)
         }
+    }
+
+    private var targetLogTokens: [String] {
+        [targetDeviceName, snapshot.device, snapshot.name]
+            .map { $0.lowercased() }
+            .filter { $0 != "—" && !$0.isEmpty }
     }
 
     private func pruneSystemErrorRecordsIfNeeded() {
@@ -243,10 +268,10 @@ final class MonitorModel {
         }
     }
 
-    private static func loadSystemErrorRecords() -> [SystemErrorRecord] {
+    private static func loadSystemErrorRecords(targetTokens: [String]) -> [SystemErrorRecord] {
         guard let data = UserDefaults.standard.data(forKey: systemErrorRecordsKey),
               let records = try? JSONDecoder().decode([SystemErrorRecord].self, from: data) else { return [] }
-        let relevantRecords = records.filter { isRelevantStorageError($0.message, targetTokens: []) }
+        let relevantRecords = records.filter { isRelevantStorageError($0.message, targetTokens: targetTokens) }
         let pruned = prunedSystemErrorRecords(relevantRecords, now: Date())
         if let prunedData = try? JSONEncoder().encode(pruned) {
             UserDefaults.standard.set(prunedData, forKey: systemErrorRecordsKey)
@@ -264,7 +289,8 @@ final class MonitorModel {
         let hasUSBStorageMarker = lower.contains("iousb") || lower.contains("usbmsc") || lower.contains("usb mass storage") || lower.contains("usbhost") || lower.range(of: #"\busb\s+(device|error|reset|timeout|failed|storage)\b"#, options: .regularExpression) != nil
         let hasDiskStorageMarker = lower.range(of: #"(?:/dev/)?disk\d+\b"#, options: .regularExpression) != nil || lower.range(of: #"\bdisk\s+(error|reset|timeout|failed|i/o|not responding)\b"#, options: .regularExpression) != nil
         let hasStorageIO = lower.contains("i/o error") || lower.contains("io error") || lower.contains("media error") || lower.contains("media not present")
-        return namesTarget || hasUSBStorageMarker || hasDiskStorageMarker || (hasStorageIO && (lower.contains("usb") || lower.contains("disk") || lower.contains("media")))
+        let hasStorageContext = hasUSBStorageMarker || hasDiskStorageMarker || hasStorageIO || lower.contains("usb") || lower.contains("disk") || lower.contains("media")
+        return namesTarget && hasStorageContext
     }
 
     private static func prunedSystemErrorRecords(_ records: [SystemErrorRecord], now: Date) -> [SystemErrorRecord] {
@@ -315,18 +341,25 @@ final class MonitorModel {
         return String(data: data.prefix(maxReadBytes), encoding: .utf8)
     }
 
-    nonisolated private static func readSnapshot() -> DriveSnapshot {
+    nonisolated private static func readSnapshot(targetDeviceTreePath: String?, targetDeviceName: String) -> DriveSnapshot {
         let devices = findUSBDevices()
-        guard let device = devices.first else {
-            return DriveSnapshot(health: .disconnected, connection: "未检测到 USB 外置物理磁盘", activity: "无目标设备", history: [0])
+        let device: USBDevice?
+        if let targetDeviceTreePath {
+            device = devices.first { $0.deviceTreePath == targetDeviceTreePath }
+        } else {
+            let targetName = targetDeviceName.lowercased()
+            device = devices.first { $0.name.lowercased().contains(targetName) }
+        }
+        guard let device else {
+            return DriveSnapshot(health: .disconnected, name: targetDeviceName, connection: "T9 未检测到（已锁定目标 USB 口）", activity: "目标设备未连接", history: [0])
         }
         let metrics = readIOMetrics(for: device.node)
         guard let metrics else {
-            return DriveSnapshot(health: .unknown, device: device.node, name: device.name, connection: "已连接", activity: "系统统计暂不可用", history: [0])
+            return DriveSnapshot(health: .unknown, device: device.node, name: device.name, deviceTreePath: device.deviceTreePath, connection: "已连接（目标 USB 口）", activity: "系统统计暂不可用", history: [0])
         }
         let active = metrics.throughput > 0.01 || metrics.operations > 0.1
         let health: Health = metrics.throughput >= 100 ? .warning : .normal
-        return DriveSnapshot(health: health, device: device.node, name: device.name, connection: "已连接（USB）", throughput: String(format: "%.2f MB/s", metrics.throughput), operations: String(format: "%.1f 次/秒", metrics.operations), activity: active ? "正在活动" : "空闲", history: [min(metrics.throughput, 100)])
+        return DriveSnapshot(health: health, device: device.node, name: device.name, deviceTreePath: device.deviceTreePath, connection: "已连接（目标 USB 口）", throughput: String(format: "%.2f MB/s", metrics.throughput), operations: String(format: "%.1f 次/秒", metrics.operations), activity: active ? "正在活动" : "空闲", history: [min(metrics.throughput, 100)])
     }
 
     nonisolated private static func findUSBDevices() -> [USBDevice] {
@@ -340,7 +373,8 @@ final class MonitorModel {
             let protocolName = (info["BusProtocol"] as? String ?? info["Protocol"] as? String ?? "").uppercased()
             guard protocolName.contains("USB") else { return nil }
             let name = (info["MediaName"] as? String ?? info["VolumeName"] as? String ?? node).trimmingCharacters(in: .whitespacesAndNewlines)
-            return USBDevice(node: node, name: name.isEmpty ? node : name)
+            let deviceTreePath = info["DeviceTreePath"] as? String ?? ""
+            return USBDevice(node: node, name: name.isEmpty ? node : name, deviceTreePath: deviceTreePath)
         }
     }
 
